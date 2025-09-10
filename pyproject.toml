@@ -1,0 +1,13 @@
+[project]
+name = "proofrl"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "deepspeed>=0.17.5",
+    "litellm>=1.77.0",
+    "math-verify>=0.8.0",
+    "transformers>=4.56.1",
+    "trl>=0.23.0",
+]
