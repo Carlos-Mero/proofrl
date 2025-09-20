@@ -1,5 +1,4 @@
 import argparse
-import sys
 import json
 import asyncio
 from pathlib import Path
@@ -81,11 +80,15 @@ def prepare_dataset(dataset_path):
     else:
         raise NotImplementedError(f"Unknown dataset name or path: {dataset_path}")
 
+    # SYSTEM_PROMPT = (
+    #     "A conversation between user and assistant. The user asks a question, and the assistant solves it. The "
+    #     "assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+    #     "The reasoning process and answer are enclosed within <think></think> tags, i.e., <think>\nThis is my "
+    #     "reasoning.\n</think>\nThis is my answer."
+    # )
     SYSTEM_PROMPT = (
         "A conversation between user and assistant. The user asks a question, and the assistant solves it. The "
         "assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-        "The reasoning process and answer are enclosed within <think></think> tags, i.e., <think>\nThis is my "
-        "reasoning.\n</think>\nThis is my answer."
     )
 
     def make_conversations(example):
@@ -278,8 +281,8 @@ def eval(ns):
     problems = [e['problem'] for e in ds]
     prover = ProofRLProver(ns.prover_base_url, ns.api_key, ns.proof_model)
     if ns.method == "rlvr":
-        evaluator = None
-        raise NotImplementedError()
+        evaluator = accuracy_reward
+        answers = [e['answer'] for e in ds]
     elif ns.method == "ttrl":
         evaluator = None
         raise NotImplementedError()
@@ -292,7 +295,15 @@ def eval(ns):
     proofs = prover(problems, reasoning_effort=ns.reasoning_effort)
     proofs = [strip_think_simple(proof) for proof in proofs]
     logger.info(f"successfully collected {len(proofs)} proofs from {ns.proof_model}")
-    evals, verifications = evaluator.verify(prompts, proofs, reasoning_effort=ns.reasoning_effort)
+
+    if ns.method == "proofrl":
+        evals, verifications = evaluator.verify(prompts, proofs, reasoning_effort=ns.reasoning_effort)
+    elif ns.method == "rlvr":
+        evals = evaluator(prompts, answers)
+        verifications = answers
+    else:
+        raise NotImplementedError()
+
     logger.info("evaluation ended")
     p = sum(evals) / len(evals)
     print(f"Obtained final accuracy: {p}")
