@@ -8,7 +8,6 @@ import logging
 from datetime import datetime, timezone
 from itertools import groupby
 from operator import itemgetter
-from collections import Counter
 from trl import GRPOConfig, GRPOTrainer, TrlParser, ScriptArguments, ModelConfig
 from trl.rewards import think_format_reward
 from datasets import load_dataset, Dataset
@@ -224,8 +223,10 @@ class LLMClient():
         logger = logging.getLogger("evaluator")
         logger.info(f"running batch inference on {len(all_messages)} samples")
         sem = asyncio.Semaphore(concurrency)
+        ALLOWED_PARAM_KEYS = {"reasoning_effort"}
+        infer_params = {k: v for k, v in kwargs.items() if k in ALLOWED_PARAM_KEYS}
         tasks = [
-            asyncio.create_task(self._infer_one(messages, sem, **kwargs))
+            asyncio.create_task(self._infer_one(messages, sem, **infer_params))
             for messages in all_messages
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -297,6 +298,11 @@ def train(script_args, grpo_cfg, model_cfg, custom_args):
     tdataset = prepare_dataset(custom_args.dataset)
     if custom_args.method == "rlvr":
         reward_funcs = [think_format_reward, accuracy_reward]
+    elif custom_args.method == "ttrl":
+        reward_funcs = [think_format_reward, ttrl_reward]
+    elif custom_args.method == "proofrl":
+        evaluator = ProofRLEvaluator(custom_args.eval_base_url, custom_args.api_key, custom_args.eval_model)
+        reward_funcs = [think_format_reward, evaluator]
     else:
         raise NotImplementedError("Unknown training method")
 
@@ -385,6 +391,8 @@ def build_parser():
     p_train.add_argument("-em", "--eval_model", help="the model used for evaluation in proofrl (if needed)", default="")
     p_train.add_argument("-d", "--dataset", help="the path to the dataset used for training", default="")
     p_train.add_argument("-ed", "--eval_dataset", help="the path to the dataset used for evaluation", default="")
+    p_train.add_argument("--eval_base_url", default="", help="the base url for evaluator")
+    p_train.add_argument("--api_key", default="", help="the api key for both prover and evaluator")
     p_train.set_defaults(handler=train, parser=p_train)
 
     p_eval = subparsers.add_parser(

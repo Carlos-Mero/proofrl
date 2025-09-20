@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "deepspeed>=0.17.5",
-    "litellm<1.77.0",
+    "litellm[proxy]<1.77.0",
     "math-verify>=0.8.0",
     "sglang[all]>=0.5.2",
     "transformers>=4.56.1",
