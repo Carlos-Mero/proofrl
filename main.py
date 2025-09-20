@@ -6,6 +6,9 @@ import random
 import re
 import logging
 from datetime import datetime, timezone
+from itertools import groupby
+from operator import itemgetter
+from collections import Counter
 from trl import GRPOConfig, GRPOTrainer, TrlParser, ScriptArguments, ModelConfig
 from trl.rewards import think_format_reward
 from datasets import load_dataset, Dataset
@@ -148,6 +151,42 @@ def accuracy_reward(completions, answer: list[str], **kwargs):
 
     return rewards
 
+def ttrl_reward(prompts, completions, **kwargs):
+    # This function divides the completions into groups according to the prompts
+    # So that it could be more robust for ttrl verification
+    contents = [completion[0]["content"] for completion in completions]
+    pairs = zip(prompts, contents)
+    rewards = []
+    for p, group in groupby(pairs, key=itemgetter(0)):
+        comps = [c for _, c in group]
+        parsed_anss = [parse(
+            comp,
+            extraction_config=[
+                LatexExtractionConfig(
+                    normalization_config=NormalizationConfig(
+                        nits=False,
+                        malformed_operators=False,
+                        basic_latex=True,
+                        boxed="all",
+                        units=True,
+                    ),
+                    boxed_match_priority=0,
+                    try_extract_without_anchor=False,
+                )
+            ],
+            extraction_mode="first_match",
+        )
+            for comp in comps
+        ]
+        # The results of TTRL is exactly the row with maximum reward sum
+        rewardsmetrix = [
+            [float(verify(a, b)) for a in parsed_anss]
+            for b in parsed_anss
+        ]
+        max_row = max(rewardsmetrix, key=sum)
+        rewards += rewardsmetrix[max_row]
+    return rewards
+
 class LLMClient():
     def __init__(self, api_base, api_key, model):
         self.api_base = api_base
@@ -284,10 +323,11 @@ def eval(ns):
         evaluator = accuracy_reward
         answers = [e['answer'] for e in ds]
     elif ns.method == "ttrl":
-        evaluator = None
-        raise NotImplementedError()
+        evaluator = ttrl_reward
     elif ns.method == "proofrl":
         evaluator = ProofRLEvaluator(ns.eval_base_url, ns.api_key, ns.eval_model)
+    else:
+        raise NotImplementedError()
 
     logdir = get_current_log_path(ns.log_dir)
     logdir.mkdir(parents=True, exist_ok=True)
@@ -301,8 +341,9 @@ def eval(ns):
     elif ns.method == "rlvr":
         evals = evaluator(prompts, answers)
         verifications = answers
-    else:
-        raise NotImplementedError()
+    elif ns.method == "ttrl":
+        evals = evaluator(prompts, answers)
+        verifications = [None] * len(evals)
 
     logger.info("evaluation ended")
     p = sum(evals) / len(evals)
