@@ -10,7 +10,7 @@ from itertools import groupby
 from operator import itemgetter
 from trl import GRPOConfig, GRPOTrainer, TrlParser, ScriptArguments, ModelConfig
 from trl.rewards import think_format_reward
-from datasets import load_dataset, Dataset
+from datasets import load_dataset, Dataset, concatenate_datasets
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 from litellm import acompletion
@@ -79,6 +79,23 @@ def prepare_dataset(dataset_path):
         ds = load_dataset(dataset_path)
         ds = ds.remove_columns(["solution"])
         ds = ds["test"]
+    elif dataset_path == "AIME24/25":
+        ds24 = load_dataset("Maxwell-Jia/AIME_2024")
+        ds24 = ds24["train"]
+        ds24 = Dataset.from_dict(
+            {
+                "problem": [e["Problem"] for e in ds24],
+                "answer": [e["Answer"] for e in ds24]
+            }
+        )
+        ds25 = load_dataset("opencompass/AIME2025")
+        ds25 = Dataset.from_dict(
+            {
+                "problem": [e["question"] for e in ds25],
+                "answer": [e["answer"] for e in ds25]
+            }
+        )
+        ds = concatenate_datasets([ds24, ds25])
     else:
         raise NotImplementedError(f"Unknown dataset name or path: {dataset_path}")
 
@@ -150,6 +167,36 @@ def accuracy_reward(completions, answer: list[str], **kwargs):
 
     return rewards
 
+def get_majority_ans(comps):
+    # This function extracts answers from given completions
+    # and returns the id of the majority of answers, and the rewards compared with this majority answer
+    parsed_anss = [parse(
+        comp,
+        extraction_config=[
+            LatexExtractionConfig(
+                normalization_config=NormalizationConfig(
+                    nits=False,
+                    malformed_operators=False,
+                    basic_latex=True,
+                    boxed="all",
+                    units=True,
+                ),
+                boxed_match_priority=0,
+                try_extract_without_anchor=False,
+            )
+        ],
+        extraction_mode="first_match",
+    )
+        for comp in comps
+    ]
+    # The results of TTRL is exactly the row with maximum reward sum
+    rewardsmatrix = [
+        [float(verify(a, b, allow_set_relation_comp=True)) for a in parsed_anss]
+        for b in parsed_anss
+    ]
+    max_row = max(rewardsmatrix, key=sum)
+    return max_row, rewardsmatrix(max_row)
+
 def ttrl_reward(prompts, completions, **kwargs):
     # This function divides the completions into groups according to the prompts
     # So that it could be more robust for ttrl verification
@@ -158,32 +205,8 @@ def ttrl_reward(prompts, completions, **kwargs):
     rewards = []
     for p, group in groupby(pairs, key=itemgetter(0)):
         comps = [c for _, c in group]
-        parsed_anss = [parse(
-            comp,
-            extraction_config=[
-                LatexExtractionConfig(
-                    normalization_config=NormalizationConfig(
-                        nits=False,
-                        malformed_operators=False,
-                        basic_latex=True,
-                        boxed="all",
-                        units=True,
-                    ),
-                    boxed_match_priority=0,
-                    try_extract_without_anchor=False,
-                )
-            ],
-            extraction_mode="first_match",
-        )
-            for comp in comps
-        ]
-        # The results of TTRL is exactly the row with maximum reward sum
-        rewardsmetrix = [
-            [float(verify(a, b)) for a in parsed_anss]
-            for b in parsed_anss
-        ]
-        max_row = max(rewardsmetrix, key=sum)
-        rewards += rewardsmetrix[max_row]
+        _, group_rewards = get_majority_ans(comps)
+        rewards += group_rewards
     return rewards
 
 class LLMClient():
@@ -223,7 +246,7 @@ class LLMClient():
         logger = logging.getLogger("evaluator")
         logger.info(f"running batch inference on {len(all_messages)} samples")
         sem = asyncio.Semaphore(concurrency)
-        ALLOWED_PARAM_KEYS = {"reasoning_effort"}
+        ALLOWED_PARAM_KEYS = {"reasoning_effort", "thinking", "enable_thinking"}
         infer_params = {k: v for k, v in kwargs.items() if k in ALLOWED_PARAM_KEYS}
         tasks = [
             asyncio.create_task(self._infer_one(messages, sem, **infer_params))
@@ -293,6 +316,30 @@ class ProofRLProver():
         ]
         results = ASYNC_LOOP.run(self.client.infer_batch_async(all_messages, **kwargs))
         return results
+
+class MajorityVotingSolver():
+    def __init__(self, api_base, api_key, model, n_samples):
+        self.client = LLMClient(api_base, api_key, model)
+        self.n_samples = n_samples
+    def __call__(self, problems: list[str], **kwargs):
+        SYSTEM_PROMPT = (
+            "You are an expert in math and is skilled in solving math problems."
+        )
+        all_messages = [
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": problem},
+            ]
+            for _ in range(self.n_samples)
+            for problem in problems
+        ]
+        results = ASYNC_LOOP.run(self.client.infer_batch_async(all_messages, **kwargs))
+        separated_results = [results[i * self.n_samples : (i+1) * self.n_samples] for i in range(len(problems))]
+        selected_results = []
+        for res in separated_results:
+            selected_id, _ = get_majority_ans(res)
+            selected_results.append(res[selected_id])
+        return selected_results
 
 def train(script_args, grpo_cfg, model_cfg, custom_args):
     tdataset = prepare_dataset(custom_args.dataset)
