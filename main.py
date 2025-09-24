@@ -14,6 +14,7 @@ from datasets import load_dataset, Dataset, concatenate_datasets
 from latex2sympy2_extended import NormalizationConfig
 from math_verify import LatexExtractionConfig, parse, verify
 from litellm import acompletion
+from tqdm import tqdm
 
 from utils.async_runner import AsyncLoopThread
 
@@ -85,10 +86,12 @@ def prepare_dataset(dataset_path):
         ds24 = Dataset.from_dict(
             {
                 "problem": [e["Problem"] for e in ds24],
-                "answer": [e["Answer"] for e in ds24]
+                "answer": [str(e["Answer"]) for e in ds24]
             }
         )
-        ds25 = load_dataset("opencompass/AIME2025")
+        ds25_1 = load_dataset("opencompass/AIME2025", "AIME2025-I")
+        ds25_2 = load_dataset("opencompass/AIME2025", "AIME2025-II")
+        ds25 = concatenate_datasets([ds25_1['test'], ds25_2['test']])
         ds25 = Dataset.from_dict(
             {
                 "problem": [e["question"] for e in ds25],
@@ -128,7 +131,7 @@ def accuracy_reward(completions, answer: list[str], **kwargs):
     - If not parseable → compare as normalized text.
     """
     rewards = []
-    contents = [completion[0]["content"] for completion in completions]
+    contents = [completion if isinstance(completion, str) else completion[0]["content"] for completion in completions]
     for content, sol in zip(contents, answer):
         try:
             gold_parsed = parse(sol, extraction_mode="first_match")
@@ -282,7 +285,7 @@ class ProofRLEvaluator():
                     "\n"
                     f"<problem>{p[1]['content']}</problem>\n"
                     "\n"
-                    f"<answer>{c if isinstance(c, str) else c[0]['content']}</answer>"
+                    f"<answer>{strip_think_simple(c if isinstance(c, str) else c[0]['content'])}</answer>"
                 )}
             ]
             for (p, c) in zip(prompts, completions)
@@ -341,6 +344,40 @@ class MajorityVotingSolver():
             selected_results.append(res[selected_id])
         return selected_results
 
+class StepProver():
+    def __init__(self, api_base, api_key, model, steps):
+        self.client = LLMClient(api_base, api_key, model)
+        self.steps = steps
+    def __call__(self, problems: list[str], **kwargs):
+        # The step prover returns all samples in each iteration step
+        SYSTEM_PROMPT = (
+            "You are an expert in math and is skilled in solving math problems."
+        )
+        all_messages = [
+            [
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": problem},
+            ]
+            for problem in problems
+        ]
+        results = ASYNC_LOOP.run(self.client.infer_batch_async(all_messages, **kwargs))
+        resultss = [results]
+        for _ in tqdm(range(self.steps)):
+            results = [strip_think_simple(r) for r in resultss[-1]]
+            STEP_PROMPT = (
+                "Here is a math problem and a candidate solution, please carefully review the correctness of this candidate and propose a more promising solution of this problem in your response."
+            )
+            step_messages = [
+                [
+                    {"role": "system", "content": SYSTEM_PROMPT},
+                    {"role": "user", "content": f"{STEP_PROMPT}\n\n## Problem\n\n{p}\n\n## Candidate Solution\n\n{r}"},
+                ]
+                for (p, r) in zip(problems, results)
+            ]
+            results = ASYNC_LOOP.run(self.client.infer_batch_async(step_messages, **kwargs))
+            resultss.append(results)
+        return resultss
+
 def train(script_args, grpo_cfg, model_cfg, custom_args):
     tdataset = prepare_dataset(custom_args.dataset)
     if custom_args.method == "rlvr":
@@ -371,8 +408,11 @@ def eval(ns):
     ds = prepare_dataset(ns.eval_dataset)
     prompts = [e['prompt'] for e in ds]
     problems = [e['problem'] for e in ds]
-    prover = ProofRLProver(ns.prover_base_url, ns.api_key, ns.proof_model)
-    if ns.method == "rlvr":
+    if ns.method == "stepf":
+        prover = StepProver(ns.prover_base_url, ns.api_key, ns.proof_model, ns.steps)
+    else:
+        prover = ProofRLProver(ns.prover_base_url, ns.api_key, ns.proof_model)
+    if ns.method == "rlvr" or ns.method == "stepf":
         evaluator = accuracy_reward
         answers = [e['answer'] for e in ds]
     elif ns.method == "ttrl":
@@ -386,21 +426,35 @@ def eval(ns):
     logdir.mkdir(parents=True, exist_ok=True)
 
     proofs = prover(problems, reasoning_effort=ns.reasoning_effort)
-    proofs = [strip_think_simple(proof) for proof in proofs]
+    # proofs = [strip_think_simple(proof) for proof in proofs]
     logger.info(f"successfully collected {len(proofs)} proofs from {ns.proof_model}")
 
     if ns.method == "proofrl":
         evals, verifications = evaluator.verify(prompts, proofs, reasoning_effort=ns.reasoning_effort)
+        p = sum(evals) / len(evals)
+        print(f"Obtained final accuracy: {p}")
     elif ns.method == "rlvr":
-        evals = evaluator(prompts, answers)
+        evals = evaluator(proofs, answers)
+        verifications = answers
+        p = sum(evals) / len(evals)
+        print(f"Obtained final accuracy: {p}")
+    elif ns.method == "stepf":
+        evals = [
+            evaluator(ps, answers)
+            for ps in proofs
+        ]
+        p = sum(evals[-1]) / len(evals[-1])
+        print(f"Obtained final accuracy: {p}")
+        # transpose the evaluation metrix
+        evals = [list(col) for col in zip(*evals)]
         verifications = answers
     elif ns.method == "ttrl":
-        evals = evaluator(prompts, answers)
+        evals = evaluator(proofs, answers)
         verifications = [None] * len(evals)
+        p = sum(evals) / len(evals)
+        print(f"Obtained final accuracy: {p}")
 
     logger.info("evaluation ended")
-    p = sum(evals) / len(evals)
-    print(f"Obtained final accuracy: {p}")
 
     vars_dict = vars(ns)
     vars_dict["accuracy"] = p
@@ -453,10 +507,11 @@ def build_parser():
     p_eval.add_argument("-em", "--eval_model", help="the model used for evaluation (if needed)", default="")
     p_eval.add_argument("--reasoning_effort", help="the reasoning_effort parameter for some models", default="medium", choices=["minimal", "low", "medium", "high"])
     # p_eval.add_argument("--eval_concurrency", help="the async concurrency in evaluation", default=8)
-    p_eval.add_argument("--method", default="rlvr", choices=["rlvr", "ttrl", "proofrl"], help="the training method switch")
+    p_eval.add_argument("--method", default="rlvr", choices=["rlvr", "ttrl", "proofrl", "stepf"], help="the training method switch")
     p_eval.add_argument("--prover_base_url", default="", help="the base url for prover")
     p_eval.add_argument("--eval_base_url", default="", help="the base url for evaluator")
     p_eval.add_argument("--api_key", default="", help="the api key for both prover and evaluator")
+    p_eval.add_argument("--steps", default=3, type=int, help="The iteration steps for stepprover")
     p_eval.set_defaults(handler=eval, parser=p_eval)
 
     return parser
