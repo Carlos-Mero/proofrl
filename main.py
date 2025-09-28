@@ -378,6 +378,90 @@ class StepProver():
             resultss.append(results)
         return resultss
 
+class Verifier():
+    def __init__(self, api_base, api_key, model, reviews):
+        self.client = LLMClient(api_base, api_key, model)
+        self.reviews = reviews
+    def __call__(self, problems, proofs, **kwargs):
+        REVIEW_PROMPT = (
+            "### Instruction\n"
+                "\n"
+                "You are an expert that is knowledgeable across all domains in math. Here you will be given a math problem and a corresponding solution in math. You need to act as a reviewer of this solution, carefully examine and verify this solution step by step.\n"
+                "\n"
+                "Please state your verification result inside $\\boxed{}$ as $\\boxed{valid}$ or $\\boxed{invalid}$. You also need to include the rationale on your decision in your response.\n"
+        )
+        review_messages = [
+            [
+                {"role": "user", "content": f"{REVIEW_PROMPT}\n### Problem\n\n{problem}\n\n### Solution\n\n{solution}"}
+            ]
+            for _ in range(self.reviews)
+            for problem, solution in zip(problems, proofs)
+        ]
+        results = ASYNC_LOOP.run(self.client.infer_batch_async(review_messages, **kwargs))
+        reviews = [{'solved': True, 'review': ''} for _ in proofs]
+        for i in range(len(proofs)):
+            for r in results[i * self.reviews : (i+1) * self.reviews]:
+                if find_boxed(r) == "invalid":
+                    reviews[i]['solved'] = False
+                    reviews[i]['review'] = r
+                    break
+        return reviews
+
+class Refiner():
+    def __init__(self, api_base, api_key, model):
+        self.client = LLMClient(api_base, api_key, model)
+    def __call__(self, problems, proofs, reviews, **kwargs):
+        REFINE_PROMPT = (
+            "### Instruction\n",
+            "\n",
+            "You are an expert that is knowledgeable across all domains in math. This time we are working with a math problem, and tried to solve it. However, one reviewer have found some flaws in our solution. Please help us refine this solution to eliminate these flaws and correctly solve the given problem.\n",
+        )
+        refine_messages = [
+            [
+                {"role": "user", "content": f"{REFINE_PROMPT}\n### Problem\n\n{problem}\n\n### Solution\n\n{proof}\n\n### Review\n\n{review}"}
+            ]
+            for problem, proof, review in zip(problems, proofs, reviews)
+        ]
+        results = ASYNC_LOOP.run(self.client.infer_batch_async(refine_messages, **kwargs))
+        return results
+
+class MALoopProver():
+    def __init__(self, api_base, api_key, model, reviews, iterations, **kwargs):
+        self.prover = ProofRLProver(api_base, api_key, model, **kwargs)
+        self.reviewer = Verifier(api_base, api_key, model, reviews, **kwargs)
+        self.refiner = Refiner(api_base, api_key, model, **kwargs)
+        self.iterations = iterations
+    def __call__(self, problems, **kwargs):
+        logger = logging.getLogger("MALoopProver")
+        logger.info("collecting initial proofs")
+        proofs = self.prover(problems, **kwargs)
+        proofs = [strip_think_simple(p) for p in proofs]
+        unsolved_idx = range(len(proofs))
+        logger.info("collected %d proofs", len(proofs))
+        for t in range(self.iterations):
+            logger.info("start %d-th review iteration", t)
+            remaining_problems = [problems[i] for i in unsolved_idx]
+            remaining_proofs = [proofs[i] for i in unsolved_idx]
+            reviews = self.reviewer(remaining_problems, remaining_proofs, **kwargs)
+            unsolved_idx = [i for i, rv in zip(unsolved_idx, reviews) if not rv['solved']]
+            logger.info("collected %d unsolved problems", len(unsolved_idx))
+            unsolved_problems = [problems[i] for i in unsolved_idx]
+            unsolved_proofs = [proofs[i] for i in unsolved_idx]
+            unsolved_reviews = [ev['review'] for ev in reviews if not ev['solved']]
+            refined_proofs = self.refiner(unsolved_problems, unsolved_proofs, unsolved_reviews, **kwargs)
+            refined_proofs = [strip_think_simple(p) for p in refined_proofs]
+            for i, p in zip(unsolved_idx, refined_proofs):
+                proofs[i] = p
+            logger.info("successfully refined %d unsolved problems", len(unsolved_proofs))
+        remaining_problems = [problems[i] for i in unsolved_idx]
+        remaining_proofs = [proofs[i] for i in unsolved_idx]
+        reviews = self.reviewer(remaining_problems, remaining_proofs, **kwargs)
+        unsolved_idx = [i for i, rv in zip(unsolved_idx, reviews) if not rv['solved']]
+        # Set proofs to empty if reviewer rejects this proof
+        for i in unsolved_idx:
+            proofs[i] = ''
+        return proofs
+
 def train(script_args, grpo_cfg, model_cfg, custom_args):
     tdataset = prepare_dataset(custom_args.dataset)
     if custom_args.method == "rlvr":
@@ -410,9 +494,11 @@ def eval(ns):
     problems = [e['problem'] for e in ds]
     if ns.method == "stepf":
         prover = StepProver(ns.prover_base_url, ns.api_key, ns.proof_model, ns.steps)
+    elif ns.method == "maloop":
+        prover = MALoopProver(ns.prover_base_url, ns.api_key, ns.proof_model, ns.reviews, ns.iterations)
     else:
         prover = ProofRLProver(ns.prover_base_url, ns.api_key, ns.proof_model)
-    if ns.method == "rlvr" or ns.method == "stepf":
+    if ns.method == "rlvr" or ns.method == "stepf" or ns.method == "maloop":
         evaluator = accuracy_reward
         answers = [e['answer'] for e in ds]
     elif ns.method == "ttrl":
@@ -431,33 +517,41 @@ def eval(ns):
 
     if ns.method == "proofrl":
         evals, verifications = evaluator.verify(prompts, proofs, reasoning_effort=ns.reasoning_effort)
-        p = sum(evals) / len(evals)
-        print(f"Obtained final accuracy: {p}")
+        accuracy = sum(evals) / len(evals)
+        print(f"Obtained final accuracy: {accuracy}")
     elif ns.method == "rlvr":
         evals = evaluator(proofs, answers)
         verifications = answers
-        p = sum(evals) / len(evals)
-        print(f"Obtained final accuracy: {p}")
+        accuracy = sum(evals) / len(evals)
+        print(f"Obtained final accuracy: {accuracy}")
     elif ns.method == "stepf":
         evals = [
             evaluator(ps, answers)
             for ps in proofs
         ]
-        p = sum(evals[-1]) / len(evals[-1])
-        print(f"Obtained final accuracy: {p}")
+        accuracy = sum(evals[-1]) / len(evals[-1])
+        print(f"Obtained final accuracy: {accuracy}")
         # transpose the evaluation metrix
         evals = [list(col) for col in zip(*evals)]
         verifications = answers
+    elif ns.method == "maloop":
+        evals = evaluator(proofs, answers)
+        verifications = answers
+        accuracy = sum(evals) / len(evals)
+        print(f"Obtained final accuracy: {accuracy}")
+        reject_rate = float(len([p for p in proofs if p == ''])) / len(evals)
+        print(f"Reject rate after reviews: {reject_rate}")
+        print(f"Final error rate: {1 - accuracy - reject_rate}")
     elif ns.method == "ttrl":
         evals = evaluator(proofs, answers)
         verifications = [None] * len(evals)
-        p = sum(evals) / len(evals)
-        print(f"Obtained final accuracy: {p}")
+        accuracy = sum(evals) / len(evals)
+        print(f"Obtained final accuracy: {accuracy}")
 
     logger.info("evaluation ended")
 
     vars_dict = vars(ns)
-    vars_dict["accuracy"] = p
+    vars_dict["accuracy"] = accuracy
     with open(logdir / "logs.json", "w", encoding="utf-8") as f:
         json.dump(vars_dict, f, ensure_ascii=False, indent=2, default=str)
 
@@ -507,11 +601,13 @@ def build_parser():
     p_eval.add_argument("-em", "--eval_model", help="the model used for evaluation (if needed)", default="")
     p_eval.add_argument("--reasoning_effort", help="the reasoning_effort parameter for some models", default="medium", choices=["minimal", "low", "medium", "high"])
     # p_eval.add_argument("--eval_concurrency", help="the async concurrency in evaluation", default=8)
-    p_eval.add_argument("--method", default="rlvr", choices=["rlvr", "ttrl", "proofrl", "stepf"], help="the training method switch")
+    p_eval.add_argument("--method", default="rlvr", choices=["rlvr", "ttrl", "proofrl", "stepf", "maloop"], help="the training method switch")
     p_eval.add_argument("--prover_base_url", default="", help="the base url for prover")
     p_eval.add_argument("--eval_base_url", default="", help="the base url for evaluator")
     p_eval.add_argument("--api_key", default="", help="the api key for both prover and evaluator")
     p_eval.add_argument("--steps", default=3, type=int, help="The iteration steps for stepprover")
+    p_eval.add_argument("--reviews", default=3, type=int, help="The reviewers in maloop")
+    p_eval.add_argument("--iterations", default=4, type=int, help="The maximum iteration steps in maloop")
     p_eval.set_defaults(handler=eval, parser=p_eval)
 
     return parser
