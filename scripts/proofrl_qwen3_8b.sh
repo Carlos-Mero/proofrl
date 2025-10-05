@@ -4,11 +4,11 @@ accelerate launch \
   --method proofrl \
   --eval_model gemini-2.5-flash \
   --model_name_or_path Qwen/Qwen3-8B \
-  --dataset nproof/train.json \
+  --dataset NP_dataset/train_3000.json \
   --learning_rate 1e-6 \
   --dtype bfloat16 \
   --max_prompt_length 2048 \
-  --max_completion_length 8192 \
+  --max_completion_length 16384 \
   --log_completions \
   --per_device_train_batch_size 1 \
   --num_generations 4 \

@@ -8,7 +8,9 @@ import logging
 from datetime import datetime, timezone
 from itertools import groupby
 from operator import itemgetter
+import torch
 from trl import GRPOConfig, GRPOTrainer, TrlParser, ScriptArguments, ModelConfig
+from trl import SFTConfig, SFTTrainer
 from trl.rewards import think_format_reward
 from datasets import load_dataset, Dataset, concatenate_datasets
 from latex2sympy2_extended import NormalizationConfig
@@ -112,14 +114,14 @@ def prepare_dataset(dataset_path):
     #     "The reasoning process and answer are enclosed within <think></think> tags, i.e., <think>\nThis is my "
     #     "reasoning.\n</think>\nThis is my answer."
     # )
-    SYSTEM_PROMPT = (
-        "A conversation between user and assistant. The user asks a question, and the assistant solves it. The "
-        "assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
-    )
+    # SYSTEM_PROMPT = (
+    #     "A conversation between user and assistant. The user asks a question, and the assistant solves it. The "
+    #     "assistant first thinks about the reasoning process in the mind and then provides the user with the answer. "
+    # )
 
     def make_conversations(example):
         return [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                # {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": example if isinstance(example, str) else example['problem']},
             ]
     prompts = [make_conversations(e) for e in ds]
@@ -287,7 +289,7 @@ class ProofRLEvaluator():
                     "\n"
                     "If all of the above are correct, append `<verification>true</verification>` at the end of your reply; otherwise, append `<verification>false</verification>`.\n"
                     "\n"
-                    f"<problem>{p[1]['content']}</problem>\n"
+                    f"<problem>{p[0]['content']}</problem>\n"
                     "\n"
                     f"<answer>{strip_think_simple(c if isinstance(c, str) else c[0]['content'])}</answer>"
                 )}
@@ -466,14 +468,42 @@ class MALoopProver():
             proofs[i] = ''
         return proofs
 
-def dft_preprocess():
+def dft_preprocess(script_args, model_cfg, custom_args):
     """
     This function preprocesses the base model to guarantee
     correct thinking format
     """
-    pass
+    with Path(custom_args.dataset).open("r", encoding="utf-8") as f:
+        elements = json.load(f)
+    # ds = Dataset.from_dict({"problem": problems})
+    ds = Dataset.from_list(
+        [
+            {
+                "prompt": [{"role": "user", "content": e['problem']}],
+                "completion": [{"role": "assistant", "content": e['proof']}]
+            }
+            for e in elements
+        ])
+    config = SFTConfig(
+        model_init_kwargs={"dtype": torch.bfloat16},
+        # loss_type="dft",
+        per_device_train_batch_size=1,
+        num_train_epochs=1
+    )
+    trainer = SFTTrainer(
+        model=model_cfg.model_name_or_path,
+        args=config,
+        train_dataset=ds,
+        eval_dataset=None,
+    )
+    trainer.train()
 
 def train(script_args, grpo_cfg, model_cfg, custom_args):
+
+    if custom_args.preprocess:
+        dft_preprocess(script_args, model_cfg, custom_args)
+        return
+
     tdataset = prepare_dataset(custom_args.dataset)
     if custom_args.method == "rlvr":
         reward_funcs = [think_format_reward, accuracy_reward]
@@ -602,6 +632,7 @@ def build_parser():
     p_train.add_argument("-ed", "--eval_dataset", help="the path to the dataset used for evaluation", default="")
     p_train.add_argument("--eval_base_url", default="", help="the base url for evaluator")
     p_train.add_argument("--api_key", default="", help="the api key for both prover and evaluator")
+    p_train.add_argument("--preprocess", action='store_true', default=False, help="Do DFT preprocess on models to ensure format")
     p_train.set_defaults(handler=train, parser=p_train)
 
     p_eval = subparsers.add_parser(
