@@ -76,6 +76,10 @@ def prepare_dataset(dataset_path):
         with Path(dataset_path).open("r", encoding="utf-8") as f:
             problems = json.load(f)
         ds = Dataset.from_dict({"problem": problems})
+    elif dataset_path == "NP_dataset/train_full.json" or dataset_path == "NP_dataset/train_3000.json" or dataset_path == "NP_dataset/test_hard.json" or dataset_path == "NP_dataset/test_random.json":
+        with Path(dataset_path).open("r", encoding="utf-8") as f:
+            problems = json.load(f)
+        ds = Dataset.from_dict({"problem": problems})
     elif dataset_path == "HuggingFaceH4/MATH-500":
         ds = load_dataset(dataset_path)
         ds = ds.remove_columns(["solution"])
@@ -462,6 +466,13 @@ class MALoopProver():
             proofs[i] = ''
         return proofs
 
+def dft_preprocess():
+    """
+    This function preprocesses the base model to guarantee
+    correct thinking format
+    """
+    pass
+
 def train(script_args, grpo_cfg, model_cfg, custom_args):
     tdataset = prepare_dataset(custom_args.dataset)
     if custom_args.method == "rlvr":
@@ -490,6 +501,9 @@ def eval(ns):
     logger.info("using eval model: %s", ns.eval_model)
 
     ds = prepare_dataset(ns.eval_dataset)
+    if ns.size > 0:
+        ds = ds.select(range(ns.size))
+
     prompts = [e['prompt'] for e in ds]
     problems = [e['problem'] for e in ds]
     if ns.method == "stepf":
@@ -595,6 +609,7 @@ def build_parser():
         add_help=True
     )
     p_eval.add_argument("-ed", "--eval_dataset", help="the path to the dataset used for evaluation", default="")
+    p_eval.add_argument("--size", help="the maximum test size of this dataset, set this to positive so that it can take effect", default=0, type=int)
     p_eval.add_argument("--log_dir", help="the logging directory path", default="eval_logs")
     p_eval.add_argument("-s", "--seed", help="random seed of this project", default=1121)
     p_eval.add_argument("-pm", "--proof_model", help="model that generates proofs for given problems", default="")
