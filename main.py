@@ -8,6 +8,8 @@ import logging
 from datetime import datetime, timezone
 from itertools import groupby
 from operator import itemgetter
+import requests
+import httpx
 import torch
 from trl import GRPOConfig, GRPOTrainer, TrlParser, ScriptArguments, ModelConfig
 from trl import SFTConfig, SFTTrainer
@@ -78,7 +80,7 @@ def prepare_dataset(dataset_path):
         with Path(dataset_path).open("r", encoding="utf-8") as f:
             problems = json.load(f)
         ds = Dataset.from_dict({"problem": problems})
-    elif dataset_path == "NP_dataset/train_full.json" or dataset_path == "NP_dataset/train_3000.json" or dataset_path == "NP_dataset/test_hard.json" or dataset_path == "NP_dataset/test_random.json":
+    elif dataset_path == "NP_dataset/train_full.json" or dataset_path == "NP_dataset/train_3000.json" or dataset_path == "NP_dataset/test_hard.json" or dataset_path == "NP_dataset/test_random.json" or dataset_path == "NP_dataset/train_300.json":
         with Path(dataset_path).open("r", encoding="utf-8") as f:
             problems = json.load(f)
         ds = Dataset.from_dict({"problem": problems})
@@ -218,16 +220,83 @@ def ttrl_reward(prompts, completions, **kwargs):
         rewards += group_rewards
     return rewards
 
+class LightRAGClient():
+    def __init__(self, base_url):
+        self.url = base_url
+        self.logger = logging.getLogger("LightRAGClient")
+
+    def insert(self, text: str, source=None):
+        # insert text to the rag server
+        url = self.url + "/documents/text"
+        data = {"text": text}
+        if source is not None:
+            data["file_source"] = source
+        try:
+            response = requests.post(url, json=data).json()
+            self.logger.info("%s", response["message"])
+        except requests.exceptions.RequestException as e:
+            self.logger.error("Requests error occured: %s", e)
+
+    def insert_texts(self, texts: list[str], sources=None):
+        url = self.url + "/documents/texts"
+        data = {"texts": texts}
+        if sources is not None:
+            data["file_sources"] = sources
+        try:
+            response = requests.post(url, json=data).json()
+            self.logger.info("%s", response["message"])
+        except requests.exceptions.RequestException as e:
+            self.logger.error("Requests error occured: %s", e)
+
+    def query(self, prompt):
+        url = self.url + "/query"
+        data = {"query": prompt, "mode": "mix", "enable_rerank": False}
+        try:
+            response = requests.post(url, json=data).json()
+            return response, response.get("references")
+        except requests.exceptions.RequestException as e:
+            self.logger.error("Requests error occured: %s", e)
+            return f"Error occured on query: {e}", None
+
+    async def aquery(self, prompt: str):
+        url = self.url + "/query"
+        data = {"query": prompt, "mode": "mix", "enable_rerank": False}
+        timeout = httpx.Timeout(connect=5.0, read=3600.0, write=30.0, pool=5.0)
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as client:
+                response = await client.post(url, json=data)
+                response_json = response.json()
+                return response_json, response_json.get("references")
+        except httpx.RequestError as e:
+            self.logger.error("HTTPX request error occured: %s", e)
+            return None
+
+    async def async_batch_query(self, prompts: list[str]):
+        # sem = asyncio.Semaphore(concurrency)
+        tasks = [
+            asyncio.create_task(self.aquery(prompt))
+            for prompt in prompts
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                raise RuntimeError(f"Task {i} failed") from r
+        logger.info("completed batch rag query on %d samples",  len(prompts))
+        return results
+
 class LLMClient():
     def __init__(self, api_base, api_key, model):
         self.api_base = api_base
         self.api_key = api_key
         self.model = model
+        self.input_tokens = []
+        self.comp_tokens = []
 
     async def _infer_one(self,
                          messages,
                          sem: asyncio.Semaphore,
-                         **kwargs) -> str:
+                         **kwargs):
         backoff = 1.0
         while True:
             try:
@@ -239,21 +308,22 @@ class LLMClient():
                         api_key=self.api_key,
                         drop_params=True,
                         **kwargs)
-                return resp.choices[0].message["content"]
+                return resp
             except Exception as e:
                 msg = str(e).lower()
                 if any(k in msg for k in ["rate", "timeout", "overloaded", "temporarily"]):
                     await asyncio.sleep(backoff + random.random() * 0.2)
                     backoff = min(backoff * 2, 60)
                     continue
-                raise
+                # raise
+                return None
 
     async def infer_batch_async(self,
                                 all_messages,
                                 concurrency: int = 8,
                                 **kwargs) -> list[str]:
         logger = logging.getLogger("evaluator")
-        logger.info(f"running batch inference on {len(all_messages)} samples")
+        logger.info("running batch inference on %d samples", len(all_messages))
         sem = asyncio.Semaphore(concurrency)
         ALLOWED_PARAM_KEYS = {"reasoning_effort", "thinking", "enable_thinking"}
         infer_params = {k: v for k, v in kwargs.items() if k in ALLOWED_PARAM_KEYS}
@@ -265,8 +335,11 @@ class LLMClient():
         for i, r in enumerate(results):
             if isinstance(r, Exception):
                 raise RuntimeError(f"Task {i} failed") from r
-        logger.info(f"completed batch inference on {len(all_messages)} samples")
-        return results
+        logger.info("completed batch inference on %d samples",  len(all_messages))
+        completions = [r.choices[0].message["content"] if r is not None else "" for r  in results]
+        self.input_tokens = [r.usage.prompt_tokens for r in results if r is not None]
+        self.comp_tokens = [r.usage.completion_tokens for r in results if r is not None]
+        return completions
 
 class ProofRLEvaluator():
     def __init__(self, api_base, api_key, model):
@@ -325,6 +398,96 @@ class ProofRLProver():
         ]
         results = ASYNC_LOOP.run(self.client.infer_batch_async(all_messages, **kwargs))
         return results
+
+class RProver():
+    # Prover with RAG experience retrieve
+    def __init__(self, api_base, api_key, model, rag_base):
+        self.client = LLMClient(api_base, api_key, model)
+        self.ragclient = LightRAGClient(rag_base)
+        self.exps = []
+
+    # def reformat_exps(self, exp):
+    #     response = ""
+    #     for e in exp:
+    #         response += strip_think_simple(e["response"])
+    #     return response
+
+    def __call__(self, problems: list[str], **kwargs):
+        # search for useful experiences from server
+        # rag_prompts = [f"Please search for some useful experiences that might be helpful in solving this math problem. You should summarize the key insights as hints in no more than 3 sentences.\n\n{p}" for p in problems]
+        rag_prompts = [f"Please search for some useful experiences that might be helpful in solving this math problem.\n\n{p}" for p in problems]
+        self.exps = ASYNC_LOOP.run(self.ragclient.async_batch_query(rag_prompts))
+        self.exps = [strip_think_simple(exp[0]["response"]) if exp is not None else "None" for exp in self.exps]
+        all_messages = [
+            [
+                {"role": "user", "content": f"Please provide a complete and rigorous solution to this problem:\n\n{p}\n\nHere are some experiences that might help you with this problem:\n\n{exp}"}
+            ]
+            for (p, exp) in zip(problems, self.exps)
+        ]
+        results = ASYNC_LOOP.run(self.client.infer_batch_async(all_messages, **kwargs))
+        return results
+
+class RVerifier():
+    def __init__(self, api_base, api_key, model, rag_base, reviews, rag_train):
+        self.client = LLMClient(api_base, api_key, model)
+        self.ragclient = LightRAGClient(rag_base)
+        self.reviews = reviews
+        self.rag_train = rag_train
+
+    def __call__(self, problems, proofs, **kwargs):
+        review_messages = [
+            [
+                {"role": "system", "content": (
+                    "You are an assistant highly proficient in mathematics. The user will provide a math problem together with its proposed solution, and your task is to verify the correctness of that solution according to the given instruction."
+                )},
+                {"role": "user", "content": (
+                    "Here is a math problem and a candidate solution of it, and you need to verify the correctness of this solution. Please check each of the following:\n"
+                    "\n"
+                    "1. The provided content is indeed a math problem and its corresponding solution, rather than unrelated material supplied by mistake.\n"
+                    "2. The solution actually derives the conclusion required by the original problem.\n"
+                    "3. Every step of calculation and formula derivation in the solution is correct.\n"
+                    "4. The hypotheses (conditions) and conclusions of any theorems used are correctly matched and applied.\n"
+                    "5. The solution relies only on the conditions given in the problem and does not introduce any additional assumptions to obtain the conclusion.\n"
+                    "\n"
+                    "If all of the above are correct, append `<verification>true</verification>` at the end of your reply; otherwise, append `<verification>false</verification>`.\n"
+                    "\n"
+                    f"<problem>{p[0]['content']}</problem>\n"
+                    "\n"
+                    f"<answer>{strip_think_simple(c if isinstance(c, str) else c[0]['content'])}</answer>"
+                )}
+            ]
+            for _ in range(self.reviews)
+            for (p, c) in zip(problems, proofs)
+        ]
+        results = ASYNC_LOOP.run(self.client.infer_batch_async(review_messages, **kwargs))
+        reviews = [{'solved': True, 'review': ''} for _ in proofs]
+        for i in range(len(proofs)):
+            for r in results[i * self.reviews : (i+1) * self.reviews]:
+                reviews[i]['review'] = r
+                if extract_xml_content(r, "verification") == "false":
+                    reviews[i]['solved'] = False
+                    break
+
+        if self.rag_train:
+            # SUMMARIZE_PROMPT = (
+            #     "### Instruction\n",
+            #     "\n"
+            #     "Here is a math problem and we have collected a candidate solution and corresponding review of it. Please help me summarize some useful experiences from these contents.\n"
+            # )
+            # summarize_prompts = [
+            #     [
+            #         {"role": "user", "content": f"{SUMMARIZE_PROMPT}\n### Problem\n\n{problem}\n\n### Solution\n\n{solution}\n\n### Review\n\n{review}"}
+            #     ]
+            #     for (problem, solution, review) in zip(problems, proofs, reviews) if review['solved']
+            # ]
+            # exps = ASYNC_LOOP.run(self.client.infer_batch_async(summarize_prompts, **kwargs))
+            exps = [
+                f"### Problem\n\n{problem}\n\n### Solution\n\n{solution}"
+                for (problem, solution, review) in zip(problems, proofs, reviews) if review['solved']
+            ]
+            self.ragclient.insert_texts(exps, ["reviewer" for _ in range(len(exps))])
+
+        return reviews
 
 class MajorityVotingSolver():
     def __init__(self, api_base, api_key, model, n_samples):
@@ -540,6 +703,8 @@ def eval(ns):
         prover = StepProver(ns.prover_base_url, ns.api_key, ns.proof_model, ns.steps)
     elif ns.method == "maloop":
         prover = MALoopProver(ns.prover_base_url, ns.api_key, ns.proof_model, ns.reviews, ns.iterations)
+    elif ns.method == "rprover":
+        prover = RProver(ns.prover_base_url, ns.api_key, ns.proof_model, ns.rag_url)
     else:
         prover = ProofRLProver(ns.prover_base_url, ns.api_key, ns.proof_model)
     if ns.method == "rlvr" or ns.method == "stepf" or ns.method == "maloop":
@@ -549,6 +714,8 @@ def eval(ns):
         evaluator = ttrl_reward
     elif ns.method == "proofrl":
         evaluator = ProofRLEvaluator(ns.eval_base_url, ns.api_key, ns.eval_model)
+    elif ns.method == "rprover":
+        evaluator = RVerifier(ns.eval_base_url, ns.api_key, ns.eval_model, ns.rag_url, ns.reviews, ns.ragtrain)
     else:
         raise NotImplementedError()
 
@@ -556,15 +723,23 @@ def eval(ns):
     logdir.mkdir(parents=True, exist_ok=True)
 
     proofs = prover(problems, reasoning_effort=ns.reasoning_effort)
-    # proofs = [strip_think_simple(proof) for proof in proofs]
-    logger.info(f"successfully collected {len(proofs)} proofs from {ns.proof_model}")
+    exps = None
+    striped_proofs = [strip_think_simple(proof) for proof in proofs]
+    logger.info("successfully collected %d proofs from %s", len(proofs), ns.proof_model)
 
     if ns.method == "proofrl":
-        evals, verifications = evaluator.verify(prompts, proofs, reasoning_effort=ns.reasoning_effort)
+        evals, verifications = evaluator.verify(prompts, striped_proofs, reasoning_effort=ns.reasoning_effort)
+        accuracy = sum(evals) / len(evals)
+        print(f"Obtained final accuracy: {accuracy}")
+    elif ns.method == "rprover":
+        reviews = evaluator(prompts, striped_proofs, reasoning_effort=ns.reasoning_effort)
+        exps = prover.exps
+        evals = [1.0 if r["solved"] else 0.0 for r in reviews]
+        verifications = [r["review"] for r in reviews]
         accuracy = sum(evals) / len(evals)
         print(f"Obtained final accuracy: {accuracy}")
     elif ns.method == "rlvr":
-        evals = evaluator(proofs, answers)
+        evals = evaluator(striped_proofs, answers)
         verifications = answers
         accuracy = sum(evals) / len(evals)
         print(f"Obtained final accuracy: {accuracy}")
@@ -579,7 +754,7 @@ def eval(ns):
         evals = [list(col) for col in zip(*evals)]
         verifications = answers
     elif ns.method == "maloop":
-        evals = evaluator(proofs, answers)
+        evals = evaluator(striped_proofs, answers)
         verifications = answers
         accuracy = sum(evals) / len(evals)
         print(f"Obtained final accuracy: {accuracy}")
@@ -587,7 +762,7 @@ def eval(ns):
         print(f"Reject rate after reviews: {reject_rate}")
         print(f"Final error rate: {1 - accuracy - reject_rate}")
     elif ns.method == "ttrl":
-        evals = evaluator(proofs, answers)
+        evals = evaluator(striped_proofs, answers)
         verifications = [None] * len(evals)
         accuracy = sum(evals) / len(evals)
         print(f"Obtained final accuracy: {accuracy}")
@@ -604,10 +779,17 @@ def eval(ns):
             "problem": problem,
             "proof": proof,
             "eval": eval,
-            "verification": verification
+            "verification": verification,
+            "input_tokens": inp_tokens,
+            "completion_tokens": comp_tokens
         }
-        for (problem, proof, eval, verification) in zip(problems, proofs, evals, verifications)
+        for (problem, proof, eval, verification, inp_tokens, comp_tokens) in zip(problems, proofs, evals, verifications, prover.client.input_tokens, prover.client.comp_tokens)
     ]
+    print(f"Average token inputs in prover: {sum(prover.client.input_tokens) / len(prover.client.input_tokens)}")
+    print(f"Average completion tokens in prover: {sum(prover.client.comp_tokens) / len(prover.client.comp_tokens)}")
+    if exps is not None:
+        for s, exp in zip(samples, exps):
+            s["exp"] = exp
 
     with open(logdir / "samples.json", "w", encoding="utf-8") as f:
         json.dump(samples, f, ensure_ascii=False, indent=2, default=str)
@@ -633,6 +815,7 @@ def build_parser():
     p_train.add_argument("--eval_base_url", default="", help="the base url for evaluator")
     p_train.add_argument("--api_key", default="", help="the api key for both prover and evaluator")
     p_train.add_argument("--preprocess", action='store_true', default=False, help="Do DFT preprocess on models to ensure format")
+    p_train.add_argument("--rag_url", default="http://localhost:9677/", help="The base url of rag server")
     p_train.set_defaults(handler=train, parser=p_train)
 
     p_eval = subparsers.add_parser(
@@ -647,13 +830,15 @@ def build_parser():
     p_eval.add_argument("-em", "--eval_model", help="the model used for evaluation (if needed)", default="")
     p_eval.add_argument("--reasoning_effort", help="the reasoning_effort parameter for some models", default="medium", choices=["minimal", "low", "medium", "high"])
     # p_eval.add_argument("--eval_concurrency", help="the async concurrency in evaluation", default=8)
-    p_eval.add_argument("--method", default="rlvr", choices=["rlvr", "ttrl", "proofrl", "stepf", "maloop"], help="the training method switch")
+    p_eval.add_argument("--method", default="rlvr", choices=["rlvr", "ttrl", "proofrl", "stepf", "maloop", "rprover"], help="the training method switch")
     p_eval.add_argument("--prover_base_url", default="", help="the base url for prover")
     p_eval.add_argument("--eval_base_url", default="", help="the base url for evaluator")
     p_eval.add_argument("--api_key", default="", help="the api key for both prover and evaluator")
     p_eval.add_argument("--steps", default=3, type=int, help="The iteration steps for stepprover")
-    p_eval.add_argument("--reviews", default=3, type=int, help="The reviewers in maloop")
+    p_eval.add_argument("--reviews", default=1, type=int, help="The reviewers in maloop")
     p_eval.add_argument("--iterations", default=4, type=int, help="The maximum iteration steps in maloop")
+    p_eval.add_argument("--rag_url", default="http://localhost:9677/", help="The base url of rag server")
+    p_eval.add_argument("--ragtrain", action='store_true', default=False, help="enable RAG training while verifying")
     p_eval.set_defaults(handler=eval, parser=p_eval)
 
     return parser
@@ -673,7 +858,8 @@ if __name__ == "__main__":
     logging.basicConfig(
         level=logging.INFO,
         format=LOG_FMT,
-        datefmt=DATE_FMT
+        datefmt=DATE_FMT,
+        force=True
     )
     logger = logging.getLogger(__name__)
     logger.info("Program Started")
